@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -19,12 +20,13 @@ import (
 )
 
 type Config struct {
-	Mode     string
-	Hostname string
-	AuthKey  string
-	Listen   string
-	Target   string
-	StateDir string
+	Mode      string
+	Hostname  string
+	AuthKey   string
+	Listen    string
+	Target    string
+	StateDir  string
+	Ephemeral bool
 }
 
 type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -33,26 +35,40 @@ func main() {
 	cfg := Config{}
 
 	flag.StringVar(&cfg.Mode, "mode", "tunnel", "tunnel or target")
-	flag.StringVar(&cfg.Hostname, "hostname", "tsrelay", "Tailscale hostname")
+	flag.StringVar(&cfg.Hostname, "hostname", "", "Tailscale hostname (default: tsrelay-<mode>)")
 	flag.StringVar(&cfg.AuthKey, "auth-key", os.Getenv("TS_AUTHKEY"), "Tailscale auth key")
-	flag.StringVar(&cfg.Listen, "listen", ":3982", "listen address")
-	flag.StringVar(&cfg.Target, "target", "", "target address")
+	flag.StringVar(&cfg.Listen, "listen", ":3982", "listen address / port")
+	flag.StringVar(&cfg.Target, "target", "", "target: IP atau hostname, port opsional (default = port listen)")
 	flag.StringVar(&cfg.StateDir, "state-dir", "", "tsnet state dir (default ~/.tsrelay/<hostname>)")
+	flag.BoolVar(&cfg.Ephemeral, "ephemeral", false, "node otomatis dihapus dari dashboard saat offline")
 	flag.Parse()
 
-	if cfg.AuthKey == "" {
-		log.Fatal("TS_AUTHKEY belum diisi")
+	if cfg.Mode != "tunnel" && cfg.Mode != "target" {
+		log.Fatal("--mode harus tunnel atau target")
 	}
 	if cfg.Target == "" {
 		log.Fatal("--target wajib diisi")
 	}
-	if cfg.Mode != "tunnel" && cfg.Mode != "target" {
-		log.Fatal("--mode harus tunnel atau target")
+	if cfg.Hostname == "" {
+		cfg.Hostname = "tsrelay-" + cfg.Mode
 	}
 
+	// --listen boleh ":3982" atau "3982"
+	if !strings.Contains(cfg.Listen, ":") {
+		cfg.Listen = ":" + cfg.Listen
+	}
+	_, listenPort, err := net.SplitHostPort(cfg.Listen)
+	if err != nil {
+		log.Fatalf("--listen tidak valid: %v", err)
+	}
+
+	// Target tanpa port -> pakai port yang sama dengan --listen
+	cfg.Target = normalizeTarget(cfg.Target, listenPort)
+
+	// State dir unik per hostname + dikunci agar 1 state hanya dipakai 1 proses
 	if cfg.StateDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
+		home, herr := os.UserHomeDir()
+		if herr != nil {
 			home = "."
 		}
 		cfg.StateDir = filepath.Join(home, ".tsrelay", cfg.Hostname)
@@ -60,11 +76,24 @@ func main() {
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		log.Fatalf("gagal buat state dir: %v", err)
 	}
+	lock, err := lockDir(cfg.StateDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer lock.Close()
+
+	// Auth key hanya wajib saat belum ada state (login pertama)
+	if cfg.AuthKey == "" {
+		if _, serr := os.Stat(filepath.Join(cfg.StateDir, "tailscaled.state")); serr != nil {
+			log.Fatal("TS_AUTHKEY belum diisi")
+		}
+	}
 
 	srv := &tsnet.Server{
-		Hostname: cfg.Hostname,
-		AuthKey:  cfg.AuthKey,
-		Dir:      cfg.StateDir,
+		Hostname:  cfg.Hostname,
+		AuthKey:   cfg.AuthKey,
+		Dir:       cfg.StateDir,
+		Ephemeral: cfg.Ephemeral,
 	}
 	defer srv.Close()
 
@@ -87,6 +116,7 @@ func main() {
 	log.Printf("TS IP    : %s", strings.Join(ips, ", "))
 	log.Printf("Listen   : %s", cfg.Listen)
 	log.Printf("Target   : %s", cfg.Target)
+	log.Printf("State    : %s", cfg.StateDir)
 	log.Printf("=================================")
 
 	var (
@@ -95,7 +125,7 @@ func main() {
 	)
 
 	if cfg.Mode == "tunnel" {
-		// Tailnet:Listen -> Target (lokal/publik, dial biasa)
+		// Tailnet:Listen -> Target (dial biasa dari mesin ini)
 		ln, err = srv.Listen("tcp", cfg.Listen)
 		if err != nil {
 			log.Fatalf("gagal listen Tailnet: %v", err)
@@ -104,13 +134,13 @@ func main() {
 		dial = d.DialContext
 		log.Printf("Tunnel aktif: Tailscale%s -> %s", cfg.Listen, cfg.Target)
 	} else {
-		// Publik:Listen -> Target (lewat Tailnet)
+		// Lokal:Listen -> Target (lewat Tailnet)
 		ln, err = net.Listen("tcp", cfg.Listen)
 		if err != nil {
-			log.Fatalf("gagal listen public: %v", err)
+			log.Fatalf("gagal listen lokal: %v", err)
 		}
 		dial = srv.Dial
-		log.Printf("Target relay aktif: %s -> Tailscale:%s", cfg.Listen, cfg.Target)
+		log.Printf("Target aktif: %s -> %s (via Tailscale)", cfg.Listen, cfg.Target)
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -122,6 +152,30 @@ func main() {
 	}()
 
 	serve(ln, dial, cfg.Target)
+}
+
+// normalizeTarget: "100.1.2.3" / "host" -> tambah defPort; "host:8080" tetap.
+func normalizeTarget(target, defPort string) string {
+	if ip := net.ParseIP(strings.Trim(target, "[]")); ip != nil {
+		return net.JoinHostPort(ip.String(), defPort)
+	}
+	if _, _, err := net.SplitHostPort(target); err == nil {
+		return target
+	}
+	return net.JoinHostPort(target, defPort)
+}
+
+// lockDir mencegah dua proses memakai state (node key) yang sama.
+func lockDir(dir string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(dir, "tsrelay.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("gagal buka lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("state dir %s sedang dipakai instance lain (pakai --hostname / --state-dir berbeda)", dir)
+	}
+	return f, nil
 }
 
 func serve(ln net.Listener, dial dialFunc, target string) {
