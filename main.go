@@ -35,11 +35,11 @@ func main() {
 	cfg := Config{}
 
 	flag.StringVar(&cfg.Mode, "mode", "tunnel", "tunnel or target")
-	flag.StringVar(&cfg.Hostname, "hostname", "", "Tailscale hostname (default: tsrelay-<mode>)")
+	flag.StringVar(&cfg.Hostname, "hostname", "tsrelay", "Tailscale hostname")
 	flag.StringVar(&cfg.AuthKey, "auth-key", os.Getenv("TS_AUTHKEY"), "Tailscale auth key")
 	flag.StringVar(&cfg.Listen, "listen", ":3982", "listen address / port")
-	flag.StringVar(&cfg.Target, "target", "", "target: IP atau hostname, port opsional (default = port listen)")
-	flag.StringVar(&cfg.StateDir, "state-dir", "", "tsnet state dir (default ~/.tsrelay/<hostname>)")
+	flag.StringVar(&cfg.Target, "target", "", "IP/hostname tujuan, port opsional (default = port listen). tunnel: default 127.0.0.1")
+	flag.StringVar(&cfg.StateDir, "state-dir", "", "tsnet state dir, identitas node disimpan di sini (default ~/.tsrelay)")
 	flag.BoolVar(&cfg.Ephemeral, "ephemeral", false, "node otomatis dihapus dari dashboard saat offline")
 	flag.Parse()
 
@@ -47,12 +47,11 @@ func main() {
 		log.Fatal("--mode harus tunnel atau target")
 	}
 	if cfg.Target == "" {
-		log.Fatal("--target wajib diisi")
+		if cfg.Mode == "target" {
+			log.Fatal("--target wajib diisi di mode target")
+		}
+		cfg.Target = "127.0.0.1" // tunnel (sisi VPS): default ke service lokal VPS
 	}
-	if cfg.Hostname == "" {
-		cfg.Hostname = "tsrelay-" + cfg.Mode
-	}
-
 	// --listen boleh ":3982" atau "3982"
 	if !strings.Contains(cfg.Listen, ":") {
 		cfg.Listen = ":" + cfg.Listen
@@ -71,7 +70,7 @@ func main() {
 		if herr != nil {
 			home = "."
 		}
-		cfg.StateDir = filepath.Join(home, ".tsrelay", cfg.Hostname)
+		cfg.StateDir = filepath.Join(home, ".tsrelay")
 	}
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
 		log.Fatalf("gagal buat state dir: %v", err)
@@ -173,7 +172,7 @@ func lockDir(dir string) (*os.File, error) {
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
-		return nil, fmt.Errorf("state dir %s sedang dipakai instance lain (pakai --hostname / --state-dir berbeda)", dir)
+		return nil, fmt.Errorf("state dir %s sedang dipakai instance lain (1 state = 1 proses)", dir)
 	}
 	return f, nil
 }
