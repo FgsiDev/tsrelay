@@ -27,21 +27,32 @@ type Config struct {
 	Target    string
 	StateDir  string
 	Ephemeral bool
+	Embedded  bool
 }
 
 type dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// diisi saat build: -ldflags "-X main.version=v1.0.5"
+var version = "dev"
 
 func main() {
 	cfg := Config{}
 
 	flag.StringVar(&cfg.Mode, "mode", "tunnel", "tunnel or target")
-	flag.StringVar(&cfg.Hostname, "hostname", "tsrelay", "Tailscale hostname")
-	flag.StringVar(&cfg.AuthKey, "auth-key", os.Getenv("TS_AUTHKEY"), "Tailscale auth key")
+	flag.StringVar(&cfg.Hostname, "hostname", "tsrelay", "Tailscale hostname (hanya untuk tsnet)")
+	flag.StringVar(&cfg.AuthKey, "auth-key", os.Getenv("TS_AUTHKEY"), "Tailscale auth key (hanya untuk tsnet)")
 	flag.StringVar(&cfg.Listen, "listen", ":3982", "listen address / port")
 	flag.StringVar(&cfg.Target, "target", "", "IP/hostname tujuan, port opsional (default = port listen). tunnel: default 127.0.0.1")
-	flag.StringVar(&cfg.StateDir, "state-dir", "", "tsnet state dir, identitas node disimpan di sini (default ~/.tsrelay)")
-	flag.BoolVar(&cfg.Ephemeral, "ephemeral", false, "node otomatis dihapus dari dashboard saat offline")
+	flag.StringVar(&cfg.StateDir, "state-dir", "", "tsnet state dir (default ~/.tsrelay)")
+	flag.BoolVar(&cfg.Ephemeral, "ephemeral", false, "tsnet: node otomatis hilang dari dashboard saat offline")
+	flag.BoolVar(&cfg.Embedded, "embedded", false, "mode target: pakai Tailscale bawaan (tsnet) = terdaftar sebagai machine baru")
+	showVersion := flag.Bool("version", false, "tampilkan versi lalu keluar")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("tsrelay", version)
+		return
+	}
 
 	if cfg.Mode != "tunnel" && cfg.Mode != "target" {
 		log.Fatal("--mode harus tunnel atau target")
@@ -50,9 +61,9 @@ func main() {
 		if cfg.Mode == "target" {
 			log.Fatal("--target wajib diisi di mode target")
 		}
-		cfg.Target = "127.0.0.1" // tunnel (sisi VPS): default ke service lokal VPS
+		cfg.Target = "127.0.0.1"
 	}
-	// --listen boleh ":3982" atau "3982"
+
 	if !strings.Contains(cfg.Listen, ":") {
 		cfg.Listen = ":" + cfg.Listen
 	}
@@ -60,14 +71,85 @@ func main() {
 	if err != nil {
 		log.Fatalf("--listen tidak valid: %v", err)
 	}
-
-	// Target tanpa port -> pakai port yang sama dengan --listen
 	cfg.Target = normalizeTarget(cfg.Target, listenPort)
 
-	// State dir unik per hostname + dikunci agar 1 state hanya dipakai 1 proses
+	var (
+		ln   net.Listener
+		dial dialFunc
+	)
+
+	switch {
+	case cfg.Mode == "target" && !cfg.Embedded:
+		// Forwarder murni: pakai Tailscale yang sudah jalan di perangkat ini.
+		// TIDAK mendaftarkan machine baru.
+		ln, err = net.Listen("tcp", cfg.Listen)
+		if err != nil {
+			log.Fatalf("gagal listen lokal: %v", err)
+		}
+		d := &net.Dialer{}
+		dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, derr := d.DialContext(ctx, network, addr)
+			if derr != nil {
+				return nil, fmt.Errorf("%w (Tailscale aktif di perangkat ini? kalau tidak, pakai --embedded)", derr)
+			}
+			return c, nil
+		}
+
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "state-dir", "auth-key", "hostname", "ephemeral":
+				log.Printf("catatan: --%s diabaikan di mode target (tanpa tsnet)", f.Name)
+			}
+		})
+
+		log.Printf("=================================")
+		log.Printf("TSRelay %s (Tailscale sistem, tanpa machine baru)", version)
+		log.Printf("Mode     : target")
+		log.Printf("Listen   : %s", cfg.Listen)
+		log.Printf("Target   : %s", cfg.Target)
+		log.Printf("=================================")
+
+	default:
+		srv, lock := startTailscale(cfg)
+		defer lock.Close()
+		defer srv.Close()
+
+		if cfg.Mode == "tunnel" {
+			// Tailnet:Listen -> Target (dial biasa dari mesin ini)
+			ln, err = srv.Listen("tcp", cfg.Listen)
+			if err != nil {
+				log.Fatalf("gagal listen Tailnet: %v", err)
+			}
+			d := &net.Dialer{}
+			dial = d.DialContext
+			log.Printf("Tunnel aktif: Tailscale%s -> %s", cfg.Listen, cfg.Target)
+		} else {
+			// --embedded: Lokal:Listen -> Target (lewat tsnet)
+			ln, err = net.Listen("tcp", cfg.Listen)
+			if err != nil {
+				log.Fatalf("gagal listen lokal: %v", err)
+			}
+			dial = srv.Dial
+			log.Printf("Target aktif: %s -> %s (via tsnet)", cfg.Listen, cfg.Target)
+		}
+	}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		log.Printf("shutdown...")
+		ln.Close()
+	}()
+
+	serve(ln, dial, cfg.Target)
+}
+
+// startTailscale menjalankan node tsnet (terdaftar sebagai machine di dashboard).
+func startTailscale(cfg Config) (*tsnet.Server, *os.File) {
 	if cfg.StateDir == "" {
-		home, herr := os.UserHomeDir()
-		if herr != nil {
+		home, err := os.UserHomeDir()
+		if err != nil {
 			home = "."
 		}
 		cfg.StateDir = filepath.Join(home, ".tsrelay")
@@ -79,9 +161,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer lock.Close()
 
-	// Auth key hanya wajib saat belum ada state (login pertama)
 	if cfg.AuthKey == "" {
 		if _, serr := os.Stat(filepath.Join(cfg.StateDir, "tailscaled.state")); serr != nil {
 			log.Fatal("TS_AUTHKEY belum diisi")
@@ -94,7 +174,6 @@ func main() {
 		Dir:       cfg.StateDir,
 		Ephemeral: cfg.Ephemeral,
 	}
-	defer srv.Close()
 
 	upCtx, upCancel := context.WithTimeout(context.Background(), 90*time.Second)
 	status, err := srv.Up(upCtx)
@@ -109,7 +188,7 @@ func main() {
 	}
 
 	log.Printf("=================================")
-	log.Printf("TSRelay")
+	log.Printf("TSRelay %s (tsnet)", version)
 	log.Printf("Mode     : %s", cfg.Mode)
 	log.Printf("Hostname : %s", cfg.Hostname)
 	log.Printf("TS IP    : %s", strings.Join(ips, ", "))
@@ -118,39 +197,7 @@ func main() {
 	log.Printf("State    : %s", cfg.StateDir)
 	log.Printf("=================================")
 
-	var (
-		ln   net.Listener
-		dial dialFunc
-	)
-
-	if cfg.Mode == "tunnel" {
-		// Tailnet:Listen -> Target (dial biasa dari mesin ini)
-		ln, err = srv.Listen("tcp", cfg.Listen)
-		if err != nil {
-			log.Fatalf("gagal listen Tailnet: %v", err)
-		}
-		d := &net.Dialer{}
-		dial = d.DialContext
-		log.Printf("Tunnel aktif: Tailscale%s -> %s", cfg.Listen, cfg.Target)
-	} else {
-		// Lokal:Listen -> Target (lewat Tailnet)
-		ln, err = net.Listen("tcp", cfg.Listen)
-		if err != nil {
-			log.Fatalf("gagal listen lokal: %v", err)
-		}
-		dial = srv.Dial
-		log.Printf("Target aktif: %s -> %s (via Tailscale)", cfg.Listen, cfg.Target)
-	}
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sig
-		log.Printf("shutdown...")
-		ln.Close()
-	}()
-
-	serve(ln, dial, cfg.Target)
+	return srv, lock
 }
 
 // normalizeTarget: "100.1.2.3" / "host" -> tambah defPort; "host:8080" tetap.
