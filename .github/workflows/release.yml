@@ -3,10 +3,14 @@ name: Build & Release
 on:
   push:
     branches: [main]
+    paths:
+      - "main.go"
     tags: ["v*"]
   pull_request:
+    paths:
+      - "main.go"
   workflow_dispatch:
-
+  
 permissions:
   contents: write
 
