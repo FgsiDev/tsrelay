@@ -157,8 +157,16 @@ Workflow ada di `.github/workflows/release.yml`.
 | `gagal connect target` | Cek IP/port target, pastikan tunnel di VPS jalan dan node-nya online |
 | `/proc/net/route permission denied`, `SO_BINDTODEVICE` | Normal di Android/Termux, bisa diabaikan |
 | DNS hostname gagal di Termux (mode `tunnel`) | Binary static Go tidak menemukan `/etc/resolv.conf`. Pakai IP di `--target` |
-| `Cannot autolaunch D-Bus without X11 $DISPLAY` | Dari program lain di Termux, tidak terkait TSRelay |
+
+## Credit
+| | |
+|---|---|
+| GitHub | [github.com/FgsiDev](https://github.com/FgsiDev) |
+| Kontak | _https://whatsapp.com/channel/0029VapkSr45q08hPPPVqy26_ |
+| Repo | [FgsiDev/tsrelay](https://github.com/FgsiDev/tsrelay) |
+
+Bug atau saran fitur? Buka [Issues](https://github.com/FgsiDev/tsrelay/issues) atau kirim pull request.
 
 ## Lisensi
 
-Tentukan sendiri (MIT, dll.).
+MIT © 2026 fh
