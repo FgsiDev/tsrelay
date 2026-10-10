@@ -81,7 +81,7 @@ Format `--listen`:
 | `8000-8100` | Rentang port |
 | `2222,8000-8100` | Gabungan |
 | `127.0.0.1:2222,8080` | Bind ke alamat tertentu |
-| `127.0.0.1` atau `all` | Semua port 1024-65535 |
+| `127.0.0.1` atau `all` | **Mode otomatis**: port mengikuti port yang terbuka di target (lihat bawah) |
 
 Contoh:
 
@@ -92,7 +92,7 @@ Contoh:
 # rentang port
 ./tsrelay --mode target --listen 8000-8100 --target 100.x.x.x
 
-# semua port (1024-65535) di localhost
+# mode otomatis: port buka/tutup mengikuti target
 ./tsrelay --mode target --listen 127.0.0.1 --target 100.x.x.x
 ```
 
@@ -101,16 +101,40 @@ Aturan:
 - `--target` tanpa port: `localhost:X` diteruskan ke `100.x.x.x:X` untuk setiap port X yang dibuka.
 - `--target` dengan port (`100.x.x.x:22`) hanya boleh dipakai dengan **satu** port listen. Kalau dipakai bersama banyak port, program langsung berhenti dengan pesan error.
 - Port yang gagal dibuka atau sudah terpakai dilewati dan dilaporkan di log. Program tetap jalan selama minimal satu port berhasil.
-- Mode semua port tidak mencakup port di bawah 1024. Kalau di VPS dengan root butuh port 22, tulis eksplisit: `--listen 22,1024-65535`.
-- Mode semua port membuka sekitar 64 ribu listener. Batas file descriptor di HP bisa membuat sebagian gagal. Kalau begitu, pakai daftar atau rentang port yang dibutuhkan saja.
 - Port tujuan yang tidak ada servicenya akan menghasilkan `connection refused` di log. Itu normal, relay hanya meneruskan.
+- Jumlah listener dibatasi setengah dari batas file descriptor perangkat, supaya masih ada fd untuk koneksi.
+
+### Mode otomatis (port mengikuti target)
+
+Kalau `--listen` hanya berisi IP (atau `all`), TSRelay memantau port di target secara berkala:
+
+- Target membuka port baru → port yang sama otomatis dibuka di lokal (`+ port 8080 dibuka`).
+- Target menutup port → port lokal otomatis ditutup (`- port 8080 ditutup`).
+
+```bash
+./tsrelay --mode target --listen 127.0.0.1 --target 100.x.x.x
+```
+
+Cara kerja dan batasan:
+
+- Pemantauan dilakukan dengan mencoba konek ke tiap port target (default 1-65535, tiap 10 detik). Port yang terbuka langsung dibuatkan listener. Port ditutup setelah 3 kali scan berturut-turut tidak terlihat terbuka (sekitar 30 detik), supaya gangguan jaringan sesaat tidak memutus relay.
+- Scan pertama bisa memakan waktu kalau banyak port yang di-drop firewall (tiap port menunggu timeout). Persempit dengan `--scan`, mis. `--scan 1-10000,25565`, supaya lebih cepat dan ringan.
+- Port di bawah 1024 tidak bisa dibuka di lokal tanpa root (Termux). Port itu dilewati dan dicatat di log. Pakai mode statis dengan port lain, mis. `--listen :2222 --target 100.x.x.x:22`.
+- Port yang sudah dipakai program lain di lokal juga dilewati, dan dicoba lagi kalau port itu muncul kembali di target.
+- Pengecekan membuka lalu langsung menutup koneksi ke tiap port terbuka. Service yang hanya menerima satu klien, atau yang mencatat tiap koneksi, bisa terpengaruh.
+- `--target` tidak boleh memakai port di mode otomatis.
+- Di mode `tunnel` (VPS), mode otomatis memantau `127.0.0.1` dan membuka tiap port yang terbuka itu ke seluruh Tailnet. Pastikan itu memang yang kamu mau.
 
 ## Flag
 
 | Flag | Default | Keterangan |
 |------|---------|------------|
 | `--mode` | `tunnel` | `tunnel` atau `target` |
-| `--listen` | `:3982` | Port listen: satu, daftar, rentang, atau semua. Lihat bagian Multi-port |
+| `--listen` | `:3982` | Port listen: satu, daftar, rentang. IP saja atau `all` = mode otomatis. Lihat bagian Multi-port |
+| `--scan` | `1-65535` | Mode otomatis: port target yang dipantau |
+| `--scan-interval` | `10s` | Mode otomatis: jeda antar scan |
+| `--scan-timeout` | `700ms` | Mode otomatis: timeout cek tiap port |
+| `--scan-workers` | `512` | Mode otomatis: jumlah cek port paralel (otomatis dikurangi sesuai batas fd) |
 | `--target` | - | IP atau hostname tujuan, port opsional. Wajib di mode `target`. Di `tunnel` default `127.0.0.1` |
 | `--hostname` | `tsrelay` | Nama node di dashboard Tailscale |
 | `--auth-key` | `$TS_AUTHKEY` | Auth key Tailscale. Hanya wajib saat login pertama |
@@ -201,7 +225,10 @@ Workflow ada di `.github/workflows/release.yml`.
 | `gagal connect target` (timeout) | Cek IP target, pastikan node tujuan online dan, di mode `tunnel`, tunnel di VPS jalan |
 | `bind: permission denied` | Port di bawah 1024 butuh root. Pakai port 1024 ke atas, mis. `--listen :2222` |
 | `... bukan alamat milik perangkat ini` | `--listen` berisi IP mesin lain. `--listen` = alamat lokal (`127.0.0.1`, `0.0.0.0`, atau kosong). IP tujuan ditulis di `--target` |
-| `--target dengan port hanya untuk satu port listen` | Multi-port tidak bisa dipetakan ke satu port tujuan. Tulis `--target` tanpa port |
+| `--target dengan port hanya untuk satu port listen` | Multi-port dan mode otomatis tidak bisa dipetakan ke satu port tujuan. Tulis `--target` tanpa port |
+| `too many open files` | Terlalu banyak port listen untuk batas fd perangkat. Pakai daftar/rentang port yang lebih kecil atau `--scan` yang lebih sempit |
+| `port N dilewati: ... permission denied` (mode otomatis) | Port di bawah 1024 tidak bisa dibuka tanpa root. Normal, bisa diabaikan |
+| Mode otomatis tidak membuka port yang seharusnya ada | Cek `--scan` mencakup port itu, dan firewall target mengizinkan koneksi dari Tailscale. Tunggu satu siklus scan |
 | `tidak ada port yang berhasil dibuka` | Semua port gagal bind (sudah terpakai atau tidak diizinkan). Lihat pesan error di baris yang sama |
 | `/proc/net/route permission denied`, `SO_BINDTODEVICE` | Normal di Android/Termux, bisa diabaikan |
 | DNS hostname gagal di Termux (mode `tunnel`) | Binary static Go tidak menemukan `/etc/resolv.conf`. Pakai IP di `--target` |
